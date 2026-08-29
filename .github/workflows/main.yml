@@ -1,0 +1,29 @@
+name: Build FARALAG AC Scanner
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build Scanner
+        shell: cmd
+        run: |
+          cl /nologo /std:c++17 /EHsc /O2 FARALAG_AC_Scanner.cpp /link winhttp.lib /OUT:FARALAG_AC_Scanner.exe
+
+      - name: Upload Scanner
+        uses: actions/upload-artifact@v4
+        with:
+          name: FARALAG_AC_Scanner
+          path: FARALAG_AC_Scanner.exe
