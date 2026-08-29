@@ -1,6 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <tlhelp32.h>
+#include <psapi.h>
 #include <winhttp.h>
 
 #include <algorithm>
@@ -11,6 +11,7 @@
 #include <vector>
 
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "psapi.lib")
 
 static std::string lower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(),
@@ -40,36 +41,47 @@ static std::vector<std::string> scan_processes() {
     };
 
     std::vector<std::string> hits;
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE) return hits;
+    DWORD processes[2048]{};
+    DWORD needed = 0;
 
-    PROCESSENTRY32A pe{};
-    pe.dwSize = sizeof(pe);
+    if (!EnumProcesses(processes, sizeof(processes), &needed))
+        return hits;
 
-    if (Process32FirstA(snap, &pe)) {
-        do {
-            std::string name = lower(pe.szExeFile);
+    const DWORD count = needed / sizeof(DWORD);
+
+    for (DWORD i = 0; i < count; ++i) {
+        if (processes[i] == 0) continue;
+
+        HANDLE hProcess = OpenProcess(
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+            FALSE,
+            processes[i]
+        );
+        if (!hProcess) continue;
+
+        char name[MAX_PATH]{};
+        if (GetModuleBaseNameA(hProcess, nullptr, name, MAX_PATH)) {
+            std::string processName = lower(name);
+
             for (const auto& indicator : indicators) {
-                if (name == indicator) {
-                    if (std::find(hits.begin(), hits.end(), name) == hits.end())
-                        hits.push_back(name);
+                if (processName == indicator) {
+                    if (std::find(hits.begin(), hits.end(), processName) == hits.end())
+                        hits.push_back(processName);
                 }
             }
-        } while (Process32NextA(snap, &pe));
+        }
+
+        CloseHandle(hProcess);
     }
 
-    CloseHandle(snap);
     return hits;
 }
 
 static bool post_result(const std::string& checkId,
                         const std::string& status,
                         const std::string& details) {
-    const wchar_t* host = L"faralag.ro";
-    const wchar_t* path = L"/ac/api/submit.php";
-
     HINTERNET session = WinHttpOpen(
-        L"FARALAG-AC-Scanner/2.0",
+        L"FARALAG-AC-Scanner/3.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,
@@ -77,17 +89,24 @@ static bool post_result(const std::string& checkId,
     );
     if (!session) return false;
 
-    HINTERNET connect = WinHttpConnect(session, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
+    HINTERNET connect = WinHttpConnect(
+        session, L"faralag.ro", INTERNET_DEFAULT_HTTPS_PORT, 0
+    );
     if (!connect) {
         WinHttpCloseHandle(session);
         return false;
     }
 
     HINTERNET request = WinHttpOpenRequest(
-        connect, L"POST", path, nullptr,
-        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+        connect,
+        L"POST",
+        L"/ac/api/submit.php",
+        nullptr,
+        WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES,
         WINHTTP_FLAG_SECURE
     );
+
     if (!request) {
         WinHttpCloseHandle(connect);
         WinHttpCloseHandle(session);
@@ -105,22 +124,24 @@ static bool post_result(const std::string& checkId,
         request,
         headers,
         static_cast<DWORD>(-1L),
-        (LPVOID)body.data(),
+        body.data(),
         static_cast<DWORD>(body.size()),
         static_cast<DWORD>(body.size()),
         0
     );
 
-    if (ok) ok = WinHttpReceiveResponse(request, nullptr);
+    if (ok)
+        ok = WinHttpReceiveResponse(request, nullptr);
 
-    DWORD statusCode = 0;
-    DWORD size = sizeof(statusCode);
+    DWORD httpStatus = 0;
+    DWORD size = sizeof(httpStatus);
+
     if (ok) {
         WinHttpQueryHeaders(
             request,
             WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
             WINHTTP_HEADER_NAME_BY_INDEX,
-            &statusCode,
+            &httpStatus,
             &size,
             WINHTTP_NO_HEADER_INDEX
         );
@@ -130,15 +151,16 @@ static bool post_result(const std::string& checkId,
     WinHttpCloseHandle(connect);
     WinHttpCloseHandle(session);
 
-    return ok && statusCode >= 200 && statusCode < 300;
+    return ok && httpStatus >= 200 && httpStatus < 300;
 }
 
 int main(int argc, char** argv) {
     std::cout << "========================================\n";
-    std::cout << "        FARALAG AC SCANNER 2.0\n";
+    std::cout << "        FARALAG AC SCANNER 3.0\n";
     std::cout << "========================================\n\n";
 
     std::string checkId;
+
     if (argc >= 2) {
         checkId = argv[1];
     } else {
@@ -146,9 +168,8 @@ int main(int argc, char** argv) {
         std::getline(std::cin, checkId);
     }
 
-    checkId = lower(checkId);
     std::transform(checkId.begin(), checkId.end(), checkId.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+        [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
 
     if (checkId.rfind("FAC-", 0) != 0 || checkId.size() < 8) {
         std::cout << "\nInvalid Check ID.\n";
@@ -159,21 +180,24 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "Check ID: " << checkId << "\n\n";
-    std::cout << "[1/3] Checking Windows processes...\n";
-    auto hits = scan_processes();
 
-    std::string status = hits.empty() ? "CLEAN" : "SUSPICIOUS";
+    std::cout << "[1/3] Scanning Windows processes...\n";
+    const auto hits = scan_processes();
+
+    const std::string status = hits.empty() ? "CLEAN" : "SUSPICIOUS";
+
     std::ostringstream details;
     details << "Process scan completed.";
     if (!hits.empty()) {
         details << " Indicators:";
-        for (const auto& h : hits) details << " " << h;
+        for (const auto& h : hits)
+            details << " " << h;
     }
 
     std::cout << "[2/3] Preparing report...\n";
     std::cout << "[3/3] Uploading report...\n";
 
-    bool uploaded = post_result(checkId, status, details.str());
+    const bool uploaded = post_result(checkId, status, details.str());
 
     std::cout << "\n========================================\n";
     std::cout << "RESULT: " << status << "\n";
@@ -181,7 +205,8 @@ int main(int argc, char** argv) {
 
     if (!hits.empty()) {
         std::cout << "\nSuspicious indicators found:\n";
-        for (const auto& h : hits) std::cout << " - " << h << "\n";
+        for (const auto& h : hits)
+            std::cout << " - " << h << "\n";
     }
 
     if (uploaded) {
@@ -194,5 +219,6 @@ int main(int argc, char** argv) {
     std::cout << "\nPress Enter to close...";
     std::string pause;
     std::getline(std::cin, pause);
+
     return uploaded ? 0 : 2;
 }
